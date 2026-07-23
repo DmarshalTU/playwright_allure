@@ -1,0 +1,391 @@
+name: Playwright + Allure
+
+# Runs once a day (06:00 UTC) or manually.
+# No push/PR triggers — use Actions → Run workflow for on-demand / multi-branch runs.
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      branches:
+        description: "Comma-separated branches to test (e.g. main,develop,feature/login)"
+        required: true
+        default: "main"
+        type: string
+      suite:
+        description: "Which suite to run"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - smoke
+          - auth
+          - regression
+          - docs
+          - custom
+      grep:
+        description: "Custom Playwright grep (when suite=custom), e.g. @login|@api"
+        required: false
+        default: ""
+        type: string
+      project:
+        description: "Browser project"
+        required: true
+        default: "chromium"
+        type: choice
+        options:
+          - chromium
+          - firefox
+          - webkit
+          - all
+      shards:
+        description: "Parallel shards per branch (bulk runs)"
+        required: true
+        default: "2"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "4"
+      include_demo_fail:
+        description: "Include intentional @demo-fail showcase test"
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: playwright-${{ github.workflow }}-${{ github.event_name }}-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  actions: read
+
+env:
+  FORCE_COLOR: 1
+
+jobs:
+  prepare:
+    name: Prepare run matrix
+    runs-on: ubuntu-latest
+    outputs:
+      test_matrix: ${{ steps.matrix.outputs.test_matrix }}
+      report_matrix: ${{ steps.matrix.outputs.report_matrix }}
+      project: ${{ steps.matrix.outputs.project }}
+      grep: ${{ steps.matrix.outputs.grep }}
+      include_demo_fail: ${{ steps.matrix.outputs.include_demo_fail }}
+      suite_label: ${{ steps.matrix.outputs.suite_label }}
+      publish_pages: ${{ steps.matrix.outputs.publish_pages }}
+      pages_branch: ${{ steps.matrix.outputs.pages_branch }}
+      branches_raw: ${{ steps.matrix.outputs.branches_raw }}
+    steps:
+      - name: Resolve inputs
+        id: matrix
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_BRANCHES: ${{ github.event.inputs.branches }}
+          INPUT_SUITE: ${{ github.event.inputs.suite }}
+          INPUT_GREP: ${{ github.event.inputs.grep }}
+          INPUT_PROJECT: ${{ github.event.inputs.project }}
+          INPUT_SHARDS: ${{ github.event.inputs.shards }}
+          INPUT_INCLUDE_FAIL: ${{ github.event.inputs.include_demo_fail }}
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, re
+
+          event = os.environ["EVENT_NAME"]
+          if event == "workflow_dispatch":
+              branches_raw = os.environ.get("INPUT_BRANCHES") or "main"
+              suite = os.environ.get("INPUT_SUITE") or "all"
+              custom_grep = os.environ.get("INPUT_GREP") or ""
+              project = os.environ.get("INPUT_PROJECT") or "chromium"
+              shards = int(os.environ.get("INPUT_SHARDS") or "2")
+              include_fail = (os.environ.get("INPUT_INCLUDE_FAIL") or "false").lower() == "true"
+              publish_pages = "true"
+          else:
+              branches_raw = "main"
+              suite = "all"
+              custom_grep = ""
+              project = "chromium"
+              shards = 2
+              include_fail = False
+              publish_pages = "true"
+
+          grep_map = {
+              "smoke": "@smoke",
+              "auth": "@auth",
+              "regression": "@regression",
+              "docs": "@docs",
+              "custom": custom_grep,
+          }
+          grep = grep_map.get(suite, "")
+
+          branches = []
+          for part in branches_raw.split(","):
+              name = part.strip()
+              if not name:
+                  continue
+              safe = re.sub(r"[^A-Za-z0-9._-]+", "-", name)
+              branches.append({"branch": name, "branch_safe": safe})
+
+          if not branches:
+              raise SystemExit("No branches provided")
+
+          test_matrix = []
+          for b in branches:
+              for shard in range(1, shards + 1):
+                  test_matrix.append({
+                      **b,
+                      "shardIndex": shard,
+                      "shardTotal": shards,
+                  })
+
+          print(f"test_matrix={json.dumps(test_matrix)}")
+          print(f"report_matrix={json.dumps(branches)}")
+          print(f"project={project}")
+          print(f"grep={grep}")
+          print(f"include_demo_fail={'true' if include_fail else 'false'}")
+          print(f"suite_label={suite}")
+          print(f"publish_pages={publish_pages}")
+          print(f"pages_branch={branches[0]['branch_safe']}")
+          print(f"branches_raw={branches_raw}")
+          PY
+
+      - name: Write run plan summary
+        run: |
+          {
+            echo "### Run plan"
+            echo ""
+            echo "| Setting | Value |"
+            echo "| --- | --- |"
+            echo "| Trigger | \`${{ github.event_name }}\` |"
+            echo "| Branches | \`${{ steps.matrix.outputs.branches_raw }}\` |"
+            echo "| Suite | \`${{ steps.matrix.outputs.suite_label }}\` |"
+            echo "| Grep | \`${{ steps.matrix.outputs.grep }}\` |"
+            echo "| Project | \`${{ steps.matrix.outputs.project }}\` |"
+            echo "| Include @demo-fail | \`${{ steps.matrix.outputs.include_demo_fail }}\` |"
+            echo "| Publish GitHub Pages | \`${{ steps.matrix.outputs.publish_pages }}\` (first branch report) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  test:
+    name: "${{ matrix.branch }} · shard ${{ matrix.shardIndex }}/${{ matrix.shardTotal }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.test_matrix) }}
+
+    steps:
+      - name: Checkout branch ${{ matrix.branch }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: |
+          if [ "${{ needs.prepare.outputs.project }}" = "all" ]; then
+            npx playwright install --with-deps
+          else
+            npx playwright install --with-deps ${{ needs.prepare.outputs.project }}
+          fi
+
+      - name: Run Playwright tests
+        id: run_tests
+        continue-on-error: true
+        env:
+          CI: true
+          ALLURE_LABEL_branch: ${{ matrix.branch }}
+          # Prefer repo secrets; fall back to public demo values for this starter.
+          TEST_USERNAME: ${{ secrets.TEST_USERNAME != '' && secrets.TEST_USERNAME || 'tomsmith' }}
+          TEST_PASSWORD: ${{ secrets.TEST_PASSWORD != '' && secrets.TEST_PASSWORD || 'SuperSecretPassword!' }}
+          API_KEY: ${{ secrets.API_KEY != '' && secrets.API_KEY || 'demo-api-key' }}
+          LOGIN_URL: ${{ secrets.LOGIN_URL }}
+        run: |
+          set -euo pipefail
+          ARGS=(test --shard=${{ matrix.shardIndex }}/${{ matrix.shardTotal }})
+
+          PROJECT="${{ needs.prepare.outputs.project }}"
+          if [ "$PROJECT" != "all" ]; then
+            ARGS+=(--project="$PROJECT")
+          fi
+
+          GREP="${{ needs.prepare.outputs.grep }}"
+          if [ -n "$GREP" ]; then
+            ARGS+=(--grep "$GREP")
+          fi
+
+          if [ "${{ needs.prepare.outputs.include_demo_fail }}" != "true" ]; then
+            ARGS+=(--grep-invert "@demo-fail")
+          fi
+
+          echo "Branch=${{ matrix.branch }} Running: npx playwright ${ARGS[*]}"
+          npx playwright "${ARGS[@]}"
+
+      - name: Upload Allure results (branch + shard)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-results-${{ matrix.branch_safe }}-${{ matrix.shardIndex }}
+          path: allure-results/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload Playwright HTML report (branch + shard)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ matrix.branch_safe }}-${{ matrix.shardIndex }}
+          path: playwright-report/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Fail job if tests failed
+        if: steps.run_tests.outcome == 'failure'
+        run: exit 1
+
+  report:
+    name: "Allure · ${{ matrix.branch }}"
+    runs-on: ubuntu-latest
+    needs: [prepare, test]
+    if: always() && needs.test.result != 'cancelled'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.report_matrix) }}
+
+    steps:
+      - name: Checkout (report tooling from workflow branch)
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download Allure results for branch
+        uses: actions/download-artifact@v4
+        with:
+          pattern: allure-results-${{ matrix.branch_safe }}-*
+          path: allure-results-merged
+          merge-multiple: true
+
+      - name: Normalize results folder
+        run: |
+          set -euo pipefail
+          mkdir -p allure-results
+          if [ -d allure-results-merged ]; then
+            find allure-results-merged -type f -exec cp -n {} allure-results/ \;
+          fi
+          count=$(find allure-results -type f | wc -l)
+          echo "Branch=${{ matrix.branch }} result files: $count"
+          if [ "$count" -eq 0 ]; then
+            echo "::warning::No Allure result files found for ${{ matrix.branch }}"
+          fi
+
+      - name: Generate Allure report
+        run: |
+          rm -rf allure-report
+          npx allure generate ./allure-results --output ./allure-report --name "Allure · ${{ matrix.branch }}"
+
+      - name: Upload Allure report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-report-${{ matrix.branch_safe }}
+          path: allure-report/
+          retention-days: 30
+
+      - name: Write artifact tips to summary
+        run: |
+          {
+            echo "## Allure report — \`${{ matrix.branch }}\`"
+            echo ""
+            echo "- **Artifact:** \`allure-report-${{ matrix.branch_safe }}\`"
+            echo "- Open locally: \`npx allure open ./allure-report\`"
+            echo ""
+            echo "| Setting | Value |"
+            echo "| --- | --- |"
+            echo "| Suite | \`${{ needs.prepare.outputs.suite_label }}\` |"
+            echo "| Grep | \`${{ needs.prepare.outputs.grep }}\` |"
+            echo "| Project | \`${{ needs.prepare.outputs.project }}\` |"
+            echo "| Tests job | \`${{ needs.test.result }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  pages:
+    name: Publish Pages
+    runs-on: ubuntu-latest
+    needs: [prepare, report]
+    if: always() && needs.prepare.outputs.publish_pages == 'true' && needs.report.result == 'success'
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Download primary branch Allure report
+        uses: actions/download-artifact@v4
+        with:
+          name: allure-report-${{ needs.prepare.outputs.pages_branch }}
+          path: allure-report
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: allure-report
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Link live report in summary
+        env:
+          PAGE_URL: ${{ steps.deployment.outputs.page_url }}
+        run: |
+          {
+            echo "## Live Allure report"
+            echo ""
+            echo "- **GitHub Pages:** ${PAGE_URL}"
+            echo "- Published report branch key: \`${{ needs.prepare.outputs.pages_branch }}\`"
+            echo ""
+            echo "First time? Enable Pages: Settings → Pages → Source = GitHub Actions"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  status:
+    name: CI status
+    runs-on: ubuntu-latest
+    needs: [test, report]
+    if: always()
+    steps:
+      - name: Check outcomes
+        run: |
+          echo "tests=${{ needs.test.result }}"
+          echo "report=${{ needs.report.result }}"
+          if [ "${{ needs.test.result }}" != "success" ]; then
+            exit 1
+          fi
+          if [ "${{ needs.report.result }}" != "success" ]; then
+            exit 1
+          fi
