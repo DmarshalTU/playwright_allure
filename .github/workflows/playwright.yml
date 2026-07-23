@@ -336,6 +336,8 @@ jobs:
     name: Publish Pages
     runs-on: ubuntu-latest
     needs: [prepare, report]
+    # Optional: Hub uses artifacts, not Pages. Don't fail the workflow if Pages isn't enabled.
+    continue-on-error: true
     if: always() && needs.prepare.outputs.publish_pages == 'true' && needs.report.result == 'success'
     environment:
       name: github-pages

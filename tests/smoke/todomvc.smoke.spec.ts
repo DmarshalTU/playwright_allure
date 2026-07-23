@@ -18,6 +18,11 @@ test.describe("TodoMVC — smoke @smoke", () => {
       await expect(page.getByRole("heading", { name: "todos" })).toBeVisible();
       await expect(page.getByPlaceholder("What needs to be done?")).toBeVisible();
     });
+
+    await allure.step("Attach success screenshot", async () => {
+      const png = await page.screenshot({ fullPage: true });
+      await allure.attachment("TodoMVC shell", png, "image/png");
+    });
   });
 
   test("can add a single todo @smoke", async ({ page }) => {

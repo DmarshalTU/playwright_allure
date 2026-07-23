@@ -44,7 +44,8 @@ export default defineConfig({
   use: {
     baseURL: process.env.BASE_URL ?? "https://demo.playwright.dev",
     trace: "retain-on-failure",
-    screenshot: "only-on-failure",
+    // Capture screenshots on pass and fail so green Allure runs still have visuals
+    screenshot: "on",
     video: "retain-on-failure",
     actionTimeout: 15_000,
   },
